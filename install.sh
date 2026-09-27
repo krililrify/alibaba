@@ -1,654 +1,111 @@
 #!/usr/bin/env bash
-
-# ============================================================
-# Alibaba Cloud Cleaner
-# Repository: https://github.com/kkkm0/alibaba-cleaner
-#
-# Purpose:
-#   Remove Alibaba Cloud host-level agents:
-#   - Alibaba Cloud Security Center / Aegis
-#   - Alibaba CloudMonitor
-#   - Alibaba Cloud Assistant
-#   - Logtail / LoongCollector when detected
-#
-# Supported:
-#   Debian / Ubuntu
-#   CentOS / RHEL / Rocky / AlmaLinux
-#   Alibaba Cloud Linux
-#
-# IMPORTANT:
-#   This script does NOT remove:
-#   - cloud-init
-#   - sshd
-#   - systemd
-#   - kernel components
-#   - normal Linux monitoring services
-#
-# ============================================================
-
+# Alibaba Cloud ECS host-agent cleaner. Run as root.
 set -u
+export LC_ALL=C
+VERSION=2.0.0
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+AGENT_RE='(AliYunDun(Monitor|Update)?|aegis|argusagent|cloudmonitor|aliyun-service|aliyun-assist|assist-daemon|loongcollector|ilogtail|logtaild)'
+PROC_NAMES='^(AliYunDun|AliYunDunMonitor|AliYunDunUpdate|AliHips|aegis|argusagent|aliyun-service|assist-daemon|AssistDaemon|loongcollector|ilogtail|logtail|logtaild)$'
+PROTECTED='^(cloud-init|systemd|sshd|lvm2-monitor|mdmonitor)(\.service)?$'
+DIRS=(/usr/local/aegis /usr/local/cloudmonitor /usr/local/share/aliyun-assist /usr/local/share/assist-daemon /usr/local/aliyun-assist /usr/local/ilogtail /usr/local/loongcollector /opt/loongcollector /etc/ilogtail /etc/loongcollector /etc/cloudmonitor)
+FILES=(/usr/sbin/aliyun-service /usr/sbin/aliyun_installer /usr/share/doc/aliyun-assist)
+UNIT_DIRS=(/etc/systemd/system /usr/lib/systemd/system /lib/systemd/system)
+RESIDUALS=()
+have(){ command -v "$1" >/dev/null 2>&1; }
+known_unit(){ [[ "${1,,}" =~ (aegis|aliyun|aliyundun|argus|cloudmonitor|assist-daemon|loongcollector|ilogtail|logtail) ]]; }
+protected(){ [[ "$1" =~ $PROTECTED ]]; }
+residual(){ RESIDUALS+=("$*"); }
+[[ $EUID -eq 0 ]] || { echo 'ERROR: run as root.' >&2; exit 1; }
+have systemctl || { echo 'ERROR: systemctl is required.' >&2; exit 1; }
+printf '\n============================================================\n Alibaba Cloud Agent Cleaner v%s\n============================================================\n' "$VERSION"
+printf 'Only identified Alibaba Cloud agents are targeted. System services are protected.\n\n'
 
-VERSION="1.0.0"
-
-# ------------------------------------------------------------
-# Colors
-# ------------------------------------------------------------
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# ------------------------------------------------------------
-# Basic functions
-# ------------------------------------------------------------
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $*"
+# PID match requires an exact comm name or an executable/cmdline under fixed agent roots.
+agent_pids(){
+    local p pid comm exe cmd
+    for p in /proc/[0-9]*; do
+        [[ -d $p ]] || continue; pid=${p##*/}; IFS= read -r comm < "$p/comm" 2>/dev/null || comm=''
+        if [[ $comm =~ $PROC_NAMES ]]; then printf '%s\n' "$pid"; continue; fi
+        exe=$(readlink -f "$p/exe" 2>/dev/null || true); cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+        case "$exe $cmd" in */usr/local/aegis/*|*/usr/local/cloudmonitor/*|*/usr/local/share/aliyun-assist/*|*/usr/local/share/assist-daemon/*|*/usr/local/aliyun-assist/*|*/usr/local/ilogtail/*|*/usr/local/loongcollector/*|*/opt/loongcollector/*) printf '%s\n' "$pid";; esac
+    done
 }
 
-success() {
-    echo -e "${GREEN}[ OK ]${NC} $*"
+printf '[1/8] Detecting Alibaba Cloud agents...\n'
+for n in AliYunDun AliYunDunMonitor AliYunDunUpdate AliHips aegis argusagent aliyun-service; do p=$(pgrep -x "$n" 2>/dev/null || true); [[ -z $p ]] || echo "Detected $n PID(s): ${p//$'\n'/, }"; done
+for d in "${DIRS[@]}"; do [[ ! -e $d ]] || echo "Detected $d"; done
+systemctl show aegis.service -p LoadState --value 2>/dev/null | grep -qv '^not-found$' && echo 'Detected aegis.service'
+if have lsattr; then for d in "${DIRS[@]}"; do [[ -e $d ]] || continue; a=$(lsattr -R "$d" 2>/dev/null | awk '$1 ~ /[ia]/ {print}' | head -20 || true); [[ -z $a ]] || printf 'Immutable/append-only entries under %s:\n%s\n' "$d" "$a"; done; fi
+
+declare -A UNITS=()
+while read -r u _; do [[ -n ${u:-} ]] || continue; b=${u##*/}; known_unit "$b" && ! protected "$b" && UNITS[$u]=1; done < <(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)
+for u in aegis.service aegis_update.service aliyun.service cloudmonitor.service aliyun-assist.service assist-daemon.service AssistDaemon.service loongcollector.service ilogtail.service logtaild.service; do s=$(systemctl show "$u" -p LoadState --value 2>/dev/null || true); [[ -z $s || $s == not-found ]] || UNITS[$u]=1; done
+printf '[2/8] Stopping services...\n'
+for u in "${!UNITS[@]}"; do systemctl stop "$u" 2>/dev/null || true; systemctl disable "$u" 2>/dev/null || true; done
+
+printf '[3/8] Running official uninstall procedures...\n'
+if [[ -d /usr/local/aegis ]]; then
+    official=''; for c in /usr/local/aegis/uninstall.sh /usr/local/aegis/aegis_client/uninstall.sh /usr/local/aegis/uninstall; do [[ -x $c ]] && official=$c && break; done
+    if [[ -n $official ]]; then "$official" >/tmp/alibaba-aegis-uninstall.log 2>&1 || echo 'Official Aegis uninstaller failed; continuing verification.'
+    elif have curl || have wget; then
+        t=$(mktemp /tmp/alibaba-aegis-uninstall.XXXXXX) || t=''
+        if [[ -n $t ]]; then
+            if { have curl && curl -fsSL --max-time 20 https://update2.aegis.aliyun.com/download/uninstall.sh -o "$t"; } || { have wget && wget -q --timeout=20 https://update2.aegis.aliyun.com/download/uninstall.sh -O "$t"; }; then bash "$t" >/tmp/alibaba-aegis-uninstall.log 2>&1 || echo 'Official Aegis uninstaller failed; continuing verification.'; else echo 'Official Aegis uninstaller unavailable; continuing local cleanup.'; fi
+            rm -f -- "$t"
+        fi
+    else echo 'curl/wget unavailable; skipped official uninstaller.'; fi
+fi
+if [[ -x /usr/local/cloudmonitor/cloudmonitorCtl.sh ]]; then /usr/local/cloudmonitor/cloudmonitorCtl.sh stop >/dev/null 2>&1 || true; /usr/local/cloudmonitor/cloudmonitorCtl.sh uninstall >/dev/null 2>&1 || true; fi
+# Remove only packages whose package names explicitly identify these agents.
+# No wildcard package expressions are passed to apt/rpm/dnf/yum.
+PKG_RE='^(aegis|aegis-client|aliyun-assist|aliyun-service|cloudmonitor|cloudmonitor-agent|ilogtail|loongcollector|logtail|logtaild)((:[^[:space:]]+)?)$'
+if have dpkg-query && have apt-get; then
+    while IFS= read -r pkg; do [[ $pkg =~ $PKG_RE ]] && DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" >/dev/null 2>&1 || true; done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+elif have rpm; then
+    while IFS= read -r pkg; do [[ $pkg =~ $PKG_RE ]] && { if have dnf; then dnf remove -y "$pkg" >/dev/null 2>&1 || true; elif have yum; then yum remove -y "$pkg" >/dev/null 2>&1 || true; else rpm -e "$pkg" >/dev/null 2>&1 || true; fi; }; done < <(rpm -qa --qf '%{NAME}\n' 2>/dev/null || true)
+fi
+
+printf '[4/8] Removing self-protection attributes...\n'
+if have chattr; then for d in "${DIRS[@]}"; do [[ -e $d ]] && chattr -R -i -a -- "$d" 2>/dev/null || true; done; for f in "${FILES[@]}"; do [[ -e $f ]] && chattr -i -a -- "$f" 2>/dev/null || true; done; else echo 'chattr unavailable; attributes may block removal.'; fi
+
+printf '[5/8] Terminating remaining processes...\n'
+p=$(agent_pids | sort -un); [[ -z $p ]] || { kill -TERM $p 2>/dev/null || true; sleep 2; }
+p=$(agent_pids | sort -un); [[ -z $p ]] || { kill -KILL $p 2>/dev/null || true; sleep 2; }
+
+printf '[6/8] Removing agent files...\n'
+for d in "${DIRS[@]}"; do [[ -e $d || -L $d ]] || continue; chattr -R -i -a -- "$d" 2>/dev/null || true; rm -rf --one-file-system -- "$d" 2>/dev/null || echo "Could not completely remove $d"; done
+for f in "${FILES[@]}"; do [[ -e $f || -L $f ]] || continue; chattr -i -a -- "$f" 2>/dev/null || true; rm -f -- "$f" 2>/dev/null || echo "Could not remove $f"; done
+
+printf '[7/8] Cleaning systemd / cron...\n'
+for d in "${UNIT_DIRS[@]}"; do
+    [[ -d $d ]] || continue
+    while IFS= read -r -d '' f; do u=${f##*/}; b=${u%%.*}; known_unit "$u" || grep -Eiq "$AGENT_RE|/usr/local/aegis|/usr/local/cloudmonitor" "$f" 2>/dev/null || continue; protected "$b" && continue; systemctl stop "$u" 2>/dev/null || true; systemctl disable "$u" 2>/dev/null || true; rm -f -- "$f" 2>/dev/null || true; done < <(find "$d" -maxdepth 3 \( -type f -o -type l \) -print0 2>/dev/null)
+done
+systemctl daemon-reload 2>/dev/null || true; systemctl reset-failed 2>/dev/null || true
+clean_cron(){
+    local f=$1 t; [[ -f $f && ! -L $f ]] || return 0
+    grep -Eiq "$AGENT_RE|/usr/local/aegis|/usr/local/cloudmonitor" "$f" || return 0
+    t=$(mktemp "${f}.clean.XXXXXX") || return 1
+    awk -v re="$AGENT_RE|/usr/local/aegis|/usr/local/cloudmonitor" 'tolower($0) !~ tolower(re)' "$f" > "$t" || { rm -f "$t"; return 1; }
+    chown --reference="$f" "$t" 2>/dev/null || true; chmod --reference="$f" "$t" 2>/dev/null || true
+    cat "$t" > "$f" || echo "Could not update cron file $f"; rm -f "$t"
 }
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
-}
-
-error() {
-    echo -e "${RED}[FAIL]${NC} $*"
-}
-
-section() {
-    echo
-    echo -e "${CYAN}============================================================${NC}"
-    echo -e "${CYAN} $*${NC}"
-    echo -e "${CYAN}============================================================${NC}"
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# ------------------------------------------------------------
-# Root check
-# ------------------------------------------------------------
-
-if [ "$(id -u)" -ne 0 ]; then
-    error "This script must be run as root."
-    echo
-    echo "Please run:"
-    echo "  sudo bash $0"
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Banner
-# ------------------------------------------------------------
-
-clear 2>/dev/null || true
-
-echo
-echo "============================================================"
-echo "        Alibaba Cloud Cleaner v${VERSION}"
-echo "============================================================"
-echo
-echo "This script removes Alibaba Cloud host agents."
-echo
-echo "Targets:"
-echo "  - Security Center / Aegis"
-echo "  - CloudMonitor"
-echo "  - Cloud Assistant"
-echo "  - Logtail / LoongCollector"
-echo
-echo "It will NOT remove cloud-init or normal Linux services."
-echo "============================================================"
-echo
-
-# ------------------------------------------------------------
-# Detect OS
-# ------------------------------------------------------------
-
-OS_ID=""
-OS_VERSION=""
-
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_VERSION="${VERSION_ID:-unknown}"
-fi
-
-info "Detected OS: ${OS_ID} ${OS_VERSION}"
-
-# ------------------------------------------------------------
-# Stop related systemd services
-# ------------------------------------------------------------
-
-section "Stopping Alibaba Cloud services"
-
-SERVICES=(
-    "aliyun.service"
-    "cloudmonitor.service"
-    "aegis.service"
-    "aegis_update.service"
-    "aliyun-assist.service"
-    "assist-daemon.service"
-    "AssistDaemon.service"
-    "loongcollector.service"
-    "ilogtail.service"
-    "logtaild.service"
-)
-
-for service in "${SERVICES[@]}"; do
-    if systemctl list-unit-files --all 2>/dev/null | grep -q "^${service} "; then
-        info "Stopping ${service}"
-        systemctl stop "$service" 2>/dev/null || true
-    fi
-done
-
-# ------------------------------------------------------------
-# Disable known services
-# ------------------------------------------------------------
-
-section "Disabling Alibaba Cloud services"
-
-for service in "${SERVICES[@]}"; do
-    if systemctl list-unit-files --all 2>/dev/null | grep -q "^${service} "; then
-        info "Disabling ${service}"
-        systemctl disable "$service" 2>/dev/null || true
-    fi
-done
-
-# ------------------------------------------------------------
-# CloudMonitor official uninstall
-# ------------------------------------------------------------
-
-section "Removing CloudMonitor"
-
-if [ -x /usr/local/cloudmonitor/cloudmonitorCtl.sh ]; then
-
-    info "CloudMonitor control script detected."
-
-    /usr/local/cloudmonitor/cloudmonitorCtl.sh stop \
-        >/dev/null 2>&1 || true
-
-    /usr/local/cloudmonitor/cloudmonitorCtl.sh uninstall \
-        >/dev/null 2>&1 || true
-
-    success "CloudMonitor uninstall command executed."
-
-else
-    info "CloudMonitor control script not found."
-fi
-
-# ------------------------------------------------------------
-# Kill CloudMonitor residual processes
-# ------------------------------------------------------------
-
-info "Stopping CloudMonitor residual processes..."
-
-pkill -9 -x argusagent 2>/dev/null || true
-pkill -9 -f "/usr/local/cloudmonitor" 2>/dev/null || true
-
-# ------------------------------------------------------------
-# Security Center / Aegis
-# ------------------------------------------------------------
-
-section "Removing Security Center / Aegis"
-
-AEGIS_FOUND=0
-
-if [ -d /usr/local/aegis ]; then
-    AEGIS_FOUND=1
-fi
-
-if pgrep -x AliYunDun >/dev/null 2>&1; then
-    AEGIS_FOUND=1
-fi
-
-if pgrep -x AliYunDunMonitor >/dev/null 2>&1; then
-    AEGIS_FOUND=1
-fi
-
-if pgrep -x AliYunDunUpdate >/dev/null 2>&1; then
-    AEGIS_FOUND=1
-fi
-
-if [ "$AEGIS_FOUND" -eq 1 ]; then
-
-    info "Alibaba Security Center / Aegis detected."
-
-    # Try official uninstall method first.
-    if command_exists curl; then
-        info "Downloading official Aegis uninstall script..."
-
-        curl -fsSL \
-            "http://update2.aegis.aliyun.com/download/uninstall.sh" \
-            -o /tmp/alibaba-aegis-uninstall.sh 2>/dev/null || true
-
-    elif command_exists wget; then
-        info "Downloading official Aegis uninstall script..."
-
-        wget -q \
-            "http://update2.aegis.aliyun.com/download/uninstall.sh" \
-            -O /tmp/alibaba-aegis-uninstall.sh 2>/dev/null || true
-    fi
-
-    if [ -s /tmp/alibaba-aegis-uninstall.sh ]; then
-
-        chmod +x /tmp/alibaba-aegis-uninstall.sh
-
-        info "Running official Aegis uninstall script..."
-
-        bash /tmp/alibaba-aegis-uninstall.sh \
-            >/tmp/alibaba-aegis-uninstall.log 2>&1 || true
-
-        rm -f /tmp/alibaba-aegis-uninstall.sh
-
-        success "Official Aegis uninstall attempted."
-
-    else
-        warn "Official Aegis uninstall script could not be downloaded."
-        warn "Continuing with local cleanup."
-    fi
-
-else
-
-    success "Security Center / Aegis not detected."
-
-fi
-
-# ------------------------------------------------------------
-# Kill Aegis processes
-# ------------------------------------------------------------
-
-info "Stopping Aegis residual processes..."
-
-pkill -9 -x AliYunDun 2>/dev/null || true
-pkill -9 -x AliYunDunMonitor 2>/dev/null || true
-pkill -9 -x AliYunDunUpdate 2>/dev/null || true
-
-pkill -9 -f "/usr/local/aegis" 2>/dev/null || true
-
-# ------------------------------------------------------------
-# Alibaba Cloud Assistant
-# ------------------------------------------------------------
-
-section "Removing Alibaba Cloud Assistant"
-
-ASSIST_FOUND=0
-
-if [ -d /usr/local/share/aliyun-assist ]; then
-    ASSIST_FOUND=1
-fi
-
-if pgrep -f "/aliyun-service" >/dev/null 2>&1; then
-    ASSIST_FOUND=1
-fi
-
-if [ "$ASSIST_FOUND" -eq 1 ]; then
-
-    info "Alibaba Cloud Assistant detected."
-
-    # Try package removal first.
-    case "$OS_ID" in
-
-        debian|ubuntu)
-            if command_exists dpkg; then
-                dpkg -l 2>/dev/null \
-                    | awk '/aliyun-assist/ {print $2}' \
-                    | while read -r pkg; do
-                        [ -n "$pkg" ] && apt-get purge -y "$pkg" 2>/dev/null || true
-                    done
-            fi
-            ;;
-
-        centos|rhel|rocky|almalinux|alinux)
-            if command_exists rpm; then
-                rpm -qa 2>/dev/null \
-                    | grep -i "aliyun-assist" \
-                    | while read -r pkg; do
-                        [ -n "$pkg" ] && rpm -e "$pkg" 2>/dev/null || true
-                    done
-            fi
-            ;;
-
-    esac
-
-    # Stop processes after package removal.
-    pkill -9 -f "/aliyun-service" 2>/dev/null || true
-    pkill -9 -f "aliyun-assist" 2>/dev/null || true
-    pkill -9 -f "assist-daemon" 2>/dev/null || true
-
-    success "Cloud Assistant cleanup attempted."
-
-else
-
-    success "Cloud Assistant not detected."
-
-fi
-
-# ------------------------------------------------------------
-# Logtail / LoongCollector
-# ------------------------------------------------------------
-
-section "Removing Logtail / LoongCollector"
-
-LOG_AGENT_FOUND=0
-
-if pgrep -f "loongcollector" >/dev/null 2>&1; then
-    LOG_AGENT_FOUND=1
-fi
-
-if pgrep -f "ilogtail" >/dev/null 2>&1; then
-    LOG_AGENT_FOUND=1
-fi
-
-if pgrep -f "logtail" >/dev/null 2>&1; then
-    LOG_AGENT_FOUND=1
-fi
-
-if [ "$LOG_AGENT_FOUND" -eq 1 ]; then
-
-    warn "Log collection agent detected."
-
-    systemctl stop loongcollector.service 2>/dev/null || true
-    systemctl disable loongcollector.service 2>/dev/null || true
-
-    systemctl stop ilogtail.service 2>/dev/null || true
-    systemctl disable ilogtail.service 2>/dev/null || true
-
-    systemctl stop logtaild.service 2>/dev/null || true
-    systemctl disable logtaild.service 2>/dev/null || true
-
-    pkill -9 -f loongcollector 2>/dev/null || true
-    pkill -9 -f ilogtail 2>/dev/null || true
-    pkill -9 -f logtail 2>/dev/null || true
-
-    rm -rf /usr/local/ilogtail
-    rm -rf /usr/local/loongcollector
-    rm -rf /opt/loongcollector
-    rm -rf /etc/ilogtail
-    rm -rf /etc/loongcollector
-
-    success "Log collection agent cleanup attempted."
-
-else
-
-    success "Logtail / LoongCollector not detected."
-
-fi
-
-# ------------------------------------------------------------
-# Remove known systemd units
-# ------------------------------------------------------------
-
-section "Cleaning systemd residuals"
-
-UNIT_PATHS=(
-    "/etc/systemd/system/aliyun.service"
-    "/etc/systemd/system/cloudmonitor.service"
-    "/etc/systemd/system/aegis.service"
-    "/etc/systemd/system/aegis_update.service"
-    "/etc/systemd/system/aliyun-assist.service"
-    "/etc/systemd/system/assist-daemon.service"
-    "/etc/systemd/system/AssistDaemon.service"
-    "/etc/systemd/system/loongcollector.service"
-    "/etc/systemd/system/ilogtail.service"
-    "/etc/systemd/system/logtaild.service"
-)
-
-for unit in "${UNIT_PATHS[@]}"; do
-    if [ -e "$unit" ]; then
-        info "Removing $unit"
-        rm -f "$unit"
-    fi
-done
-
-# Remove known wants symlinks.
-find /etc/systemd/system \
-    -type l \
-    \( -iname '*aliyun*' \
-    -o -iname '*cloudmonitor*' \
-    -o -iname '*aegis*' \
-    -o -iname '*loongcollector*' \
-    -o -iname '*ilogtail*' \
-    -o -iname '*logtail*' \) \
-    -delete 2>/dev/null || true
-
-systemctl daemon-reload
-systemctl reset-failed 2>/dev/null || true
-
-# ------------------------------------------------------------
-# Remove known Alibaba directories/files
-# ------------------------------------------------------------
-
-section "Removing Alibaba Cloud agent files"
-
-PATHS=(
-    "/usr/local/aegis"
-    "/usr/local/cloudmonitor"
-    "/usr/local/share/aliyun-assist"
-    "/usr/local/share/assist-daemon"
-    "/usr/local/aliyun-assist"
-    "/usr/local/ilogtail"
-    "/usr/local/loongcollector"
-    "/opt/loongcollector"
-    "/etc/ilogtail"
-    "/etc/loongcollector"
-    "/etc/cloudmonitor"
-    "/usr/sbin/aliyun-service"
-    "/usr/sbin/aliyun_installer"
-    "/usr/share/doc/aliyun-assist"
-)
-
-for path in "${PATHS[@]}"; do
-    if [ -e "$path" ]; then
-        info "Removing $path"
-        rm -rf "$path"
-    fi
-done
-
-# ------------------------------------------------------------
-# Remove known cron entries
-# ------------------------------------------------------------
-
-section "Checking cron entries"
-
-CRON_FILES=(
-    "/etc/crontab"
-    "/etc/cron.d"
-    "/etc/cron.hourly"
-    "/etc/cron.daily"
-    "/etc/cron.weekly"
-    "/etc/cron.monthly"
-    "/var/spool/cron"
-    "/var/spool/cron/crontabs"
-)
-
-for dir in "${CRON_FILES[@]}"; do
-    if [ -e "$dir" ]; then
-        grep -RIlE \
-            'aliyun|aliyundun|aegis|argusagent|cloudmonitor|loongcollector|ilogtail|logtail' \
-            "$dir" 2>/dev/null \
-            | while read -r file; do
-                warn "Possible Alibaba Cloud cron entry: $file"
-            done
-    fi
-done
-
-# ------------------------------------------------------------
-# Kill any remaining known processes
-# ------------------------------------------------------------
-
-section "Final process cleanup"
-
-PROCESS_PATTERNS=(
-    "AliYunDun"
-    "AliYunDunMonitor"
-    "AliYunDunUpdate"
-    "argusagent"
-    "/aliyun-service"
-    "aliyun-assist"
-    "assist-daemon"
-    "loongcollector"
-    "ilogtail"
-)
-
-for pattern in "${PROCESS_PATTERNS[@]}"; do
-    pkill -9 -f "$pattern" 2>/dev/null || true
-done
-
-sleep 2
-
-# ------------------------------------------------------------
-# Verification
-# ------------------------------------------------------------
-
-section "Final verification"
-
-FOUND=0
-
-echo
-echo "[1] Processes"
-PROCESS_RESULT="$(
-    ps auxww 2>/dev/null \
-    | grep -Ei \
-    'aliyun|aliyundun|aegis|argusagent|cloudmonitor|loongcollector|ilogtail|logtail' \
-    | grep -vE 'grep|alibaba-cleaner|install.sh' \
-    || true
-)"
-
-if [ -n "$PROCESS_RESULT" ]; then
-    echo "$PROCESS_RESULT"
-    FOUND=1
-else
-    success "No known Alibaba Cloud agent processes found."
-fi
-
-echo
-echo "[2] systemd services"
-
-SERVICE_RESULT="$(
-    systemctl list-units --type=service --all 2>/dev/null \
-    | grep -Ei \
-    'aliyun|aliyundun|aegis|argus|cloudmonitor|loongcollector|ilogtail|logtail' \
-    | grep -vE 'cloud-init|lvm2-monitor|mdmonitor|ubuntu-advantage' \
-    || true
-)"
-
-if [ -n "$SERVICE_RESULT" ]; then
-    echo "$SERVICE_RESULT"
-    FOUND=1
-else
-    success "No known Alibaba Cloud agent services found."
-fi
-
-echo
-echo "[3] Agent directories"
-
-DIR_RESULT=""
-
-for path in \
-    /usr/local/aegis \
-    /usr/local/cloudmonitor \
-    /usr/local/share/aliyun-assist \
-    /usr/local/share/assist-daemon \
-    /usr/local/ilogtail \
-    /usr/local/loongcollector \
-    /opt/loongcollector \
-    /etc/ilogtail \
-    /etc/loongcollector \
-    /etc/cloudmonitor
-do
-    if [ -e "$path" ]; then
-        DIR_RESULT="${DIR_RESULT}${path}"$'\n'
-    fi
-done
-
-if [ -n "$DIR_RESULT" ]; then
-    echo "$DIR_RESULT"
-    FOUND=1
-else
-    success "Known Alibaba Cloud agent directories are clean."
-fi
-
-echo
-echo "[4] Network connections"
-
-NET_RESULT="$(
-    ss -ntp 2>/dev/null \
-    | grep -Ei \
-    'AliYunDun|argusagent|aliyun|cloudmonitor|aegis|loongcollector|ilogtail|logtail' \
-    || true
-)"
-
-if [ -n "$NET_RESULT" ]; then
-    echo "$NET_RESULT"
-    FOUND=1
-else
-    success "No known Alibaba Cloud agent network connections found."
-fi
-
-echo
-echo "[5] Systemd unit files"
-
-UNIT_RESULT="$(
-    find /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system \
-    -type f 2>/dev/null \
-    | grep -Ei \
-    '/(aliyun|aliyundun|aegis|argus|cloudmonitor|loongcollector|ilogtail|logtail)' \
-    || true
-)"
-
-if [ -n "$UNIT_RESULT" ]; then
-    echo "$UNIT_RESULT"
-    FOUND=1
-else
-    success "No known Alibaba Cloud agent unit files found."
-fi
-
-# ------------------------------------------------------------
-# Result
-# ------------------------------------------------------------
-
-section "Cleanup result"
-
-if [ "$FOUND" -eq 0 ]; then
-
-    echo
-    echo -e "${GREEN}============================================================${NC}"
-    echo -e "${GREEN} Alibaba Cloud agents successfully cleaned.${NC}"
-    echo -e "${GREEN}============================================================${NC}"
-    echo
-    echo "Detected and removed where applicable:"
-    echo "  - Security Center / Aegis"
-    echo "  - CloudMonitor"
-    echo "  - Cloud Assistant"
-    echo "  - Logtail / LoongCollector"
-    echo
-    echo "Normal system components were intentionally preserved:"
-    echo "  - cloud-init"
-    echo "  - systemd"
-    echo "  - sshd"
-    echo "  - LVM monitoring"
-    echo "  - mdmonitor"
-    echo
-    echo "A reboot is recommended."
-    echo
-
-else
-
-    echo
-    echo -e "${YELLOW}============================================================${NC}"
-    echo -e "${YELLOW} Cleanup completed, but residuals were detected.${NC}"
-    echo -e "${YELLOW}============================================================${NC}"
-    echo
-    echo "Please review the items listed above."
-    echo
-
-fi
-
-exit 0
+for f in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/* /var/spool/cron/crontabs/*; do [[ ! -e $f ]] || clean_cron "$f"; done
+# A supervisor may have relaunched a process during the earlier cleanup. Stop
+# the already disabled service sources above, make one more exact-PID pass,
+# and verify after the grace period.
+p=$(agent_pids | sort -un); [[ -z $p ]] || { echo "Agent process reappeared; terminating exact PID(s): ${p//$'\n'/, }"; kill -TERM $p 2>/dev/null || true; sleep 2; }
+p=$(agent_pids | sort -un); [[ -z $p ]] || { kill -KILL $p 2>/dev/null || true; sleep 2; }
+
+printf '[8/8] Final verification...\n'
+for n in AliYunDun AliYunDunMonitor AliYunDunUpdate AliHips aegis argusagent aliyun-service; do p=$(pgrep -x "$n" 2>/dev/null || true); [[ -z $p ]] || residual "Process $n remains (PID(s): ${p//$'\n'/, })"; done
+p=$(agent_pids | sort -un); [[ -z $p ]] || residual "Agent path process remains (PID(s): ${p//$'\n'/, })"
+for d in "${DIRS[@]}"; do [[ ! -e $d && ! -L $d ]] || residual "Directory remains: $d"; done
+for f in "${FILES[@]}"; do [[ ! -e $f && ! -L $f ]] || residual "Agent file remains: $f"; done
+while read -r u _; do [[ -n ${u:-} ]] || continue; b=${u##*/}; known_unit "$b" && ! protected "$b" && residual "systemd unit remains: $u ($(systemctl show "$u" -p ActiveState --value 2>/dev/null || echo unknown))"; done < <(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)
+while read -r u _; do [[ -n ${u:-} ]] || continue; b=${u##*/}; known_unit "$b" && ! protected "$b" || continue; state=$(systemctl show "$u" -p ActiveState --value 2>/dev/null || true); [[ $state != active && $state != activating ]] || residual "Agent service is still running: $u ($state)"; done < <(systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null || true)
+for d in "${UNIT_DIRS[@]}"; do [[ -d $d ]] || continue; while IFS= read -r -d '' f; do u=${f##*/}; b=${u%%.*}; if { known_unit "$u" || grep -Eiq "$AGENT_RE|/usr/local/aegis|/usr/local/cloudmonitor" "$f" 2>/dev/null; } && ! protected "$b"; then residual "systemd unit file remains: $f"; fi; done < <(find "$d" -maxdepth 3 \( -type f -o -type l \) -print0 2>/dev/null); done
+for f in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/* /var/spool/cron/crontabs/*; do [[ -f $f ]] && grep -Eiq "$AGENT_RE|/usr/local/aegis|/usr/local/cloudmonitor" "$f" && residual "Cron entry remains in $f"; done
+if have ss; then n=$(ss -ntup 2>/dev/null | grep -Ei "$AGENT_RE|100\.100\.(88\.88|80\.184)" || true); [[ -z $n ]] || while IFS= read -r line; do residual "Agent-related network connection: $line"; done <<< "$n"; fi
+if ((${#RESIDUALS[@]})); then printf '\n============================================================\n Alibaba Cloud Agent Cleanup: FAILED / RESIDUALS DETECTED\n============================================================\nCleanup completed, but residuals were detected:\n'; printf ' - %s\n' "${RESIDUALS[@]}"; exit 1; fi
+printf '\n============================================================\n Alibaba Cloud Agent Cleanup: SUCCESS\n============================================================\nAll checked processes, services, directories, cron entries, and network connections are absent.\n'
